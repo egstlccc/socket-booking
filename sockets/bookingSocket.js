@@ -161,6 +161,7 @@ module.exports = (io, socket) => {
           rating: (d && (d.rating || d.rating === 0 ? d.rating : undefined)) ?? 5.0,
           carPlate: d && d.carPlate || socket.user.carPlate
         };
+        // Emit a backward-compatible event name
         const acceptPayload = {
           bookingId: String(updated._id),
           status: 'accepted',
@@ -169,6 +170,33 @@ module.exports = (io, socket) => {
         };
         try { logger.info('[socket->room] booking_accept', { room, bookingId: acceptPayload.bookingId, driverId: driverPayload.id }); } catch (_) {}
         io.to(room).emit('booking_accept', acceptPayload);
+
+        // Emit booking:accepted with a full booking object for clients expecting the complete payload
+        try {
+          const fullBookingPayload = {
+            id: String(updated._id),
+            passengerId: String(updated.passengerId || ''),
+            driverId: String(updated.driverId || ''),
+            pickup: updated.pickup || { latitude: 0.0, longitude: 0.0, address: 'Unknown Location', name: 'Unknown' },
+            dropoff: updated.dropoff || { latitude: 0.0, longitude: 0.0, address: 'Unknown Location', name: 'Unknown' },
+            vehicleType: updated.vehicleType || 'unknown',
+            status: 'accepted',
+            estimatedFare: updated.fareEstimated ?? null,
+            finalFare: updated.fareFinal ?? null,
+            paymentMethod: updated.paymentMethod || 'cash',
+            driver: {
+              name: driverPayload.name || null,
+              photoUrl: (d && d.photoUrl) || null,
+              rating: (driverPayload.rating ?? null),
+              phone: driverPayload.phone || null,
+              vehicle: driverPayload.carName || driverPayload.vehicleType || null
+            },
+            createdAt: updated.createdAt,
+            updatedAt: updated.updatedAt
+          };
+          try { logger.info('[socket->room] booking:accepted', { bookingId: fullBookingPayload.id, driverId: driverPayload.id }); } catch (_) {}
+          io.to(room).emit('booking:accepted', fullBookingPayload);
+        } catch (_) {}
       } catch (_) {}
 
       // Inform nearby drivers to remove

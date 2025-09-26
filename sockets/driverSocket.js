@@ -3,6 +3,95 @@ const driverEvents = require('../events/driverEvents');
 const logger = require('../utils/logger');
 
 module.exports = (io, socket) => {
+  async function emitNearbySnapshotForDriver() {
+    try {
+      const { Booking } = require('../models/bookingModels');
+      const { Driver } = require('../models/userModels');
+      const { Wallet } = require('../models/common');
+      const financeService = require('../services/financeService');
+      const geolib = require('geolib');
+
+      const driverId = String(socket.user.id);
+      const me = await Driver.findById(driverId).lean();
+      const radiusKm = parseFloat(process.env.BROADCAST_RADIUS_KM || process.env.RADIUS_KM || '5');
+
+      const currentRows = await Booking.find({ driverId, status: { $in: ['accepted', 'ongoing', 'requested'] } })
+        .sort({ createdAt: -1 })
+        .limit(50)
+        .lean();
+
+      const currentBookings = currentRows.map(b => ({
+        id: String(b._id),
+        status: b.status,
+        pickup: b.pickup,
+        dropoff: b.dropoff,
+        fareEstimated: b.fareEstimated,
+        fareFinal: b.fareFinal,
+        distanceKm: b.distanceKm,
+        passenger: b.passengerId ? { id: String(b.passengerId), name: b.passengerName, phone: b.passengerPhone } : undefined,
+        createdAt: b.createdAt,
+        updatedAt: b.updatedAt,
+        patch: {
+          status: b.status,
+          passengerId: String(b.passengerId || ''),
+          vehicleType: b.vehicleType,
+          pickup: b.pickup,
+          dropoff: b.dropoff,
+          passenger: b.passengerId ? { id: String(b.passengerId), name: b.passengerName, phone: b.passengerPhone } : undefined
+        }
+      }));
+
+      let nearby = [];
+      try {
+        if (me && me.lastKnownLocation && Number.isFinite(me.lastKnownLocation.latitude) && Number.isFinite(me.lastKnownLocation.longitude)) {
+          const open = await Booking.find({ status: 'requested', $or: [{ driverId: { $exists: false } }, { driverId: null }, { driverId: '' }] })
+            .sort({ createdAt: -1 })
+            .limit(200)
+            .lean();
+          const withDistance = open.map(b => ({
+            booking: b,
+            distanceKm: geolib.getDistance(
+              { latitude: me.lastKnownLocation.latitude, longitude: me.lastKnownLocation.longitude },
+              { latitude: b.pickup?.latitude, longitude: b.pickup?.longitude }
+            ) / 1000
+          }))
+            .filter(x => Number.isFinite(x.distanceKm) && x.distanceKm <= radiusKm)
+            .sort((a, b) => a.distanceKm - b.distanceKm);
+
+          const w = await Wallet.findOne({ userId: driverId, role: 'driver' }).lean();
+          const balance = w ? Number(w.balance || 0) : 0;
+          nearby = withDistance
+            .filter(x => financeService.canAcceptBooking(balance, x.booking.fareFinal || x.booking.fareEstimated || 0))
+            .slice(0, 50)
+            .map(x => ({
+              id: String(x.booking._id),
+              status: x.booking.status,
+              pickup: x.booking.pickup,
+              dropoff: x.booking.dropoff,
+              fareEstimated: x.booking.fareEstimated,
+              fareFinal: x.booking.fareFinal,
+              distanceKm: Math.round(x.distanceKm * 100) / 100,
+              passenger: x.booking.passengerId ? { id: String(x.booking.passengerId), name: x.booking.passengerName, phone: x.booking.passengerPhone } : undefined,
+              createdAt: x.booking.createdAt,
+              updatedAt: x.booking.updatedAt
+            }));
+        }
+      } catch (_) {}
+
+      const payload = {
+        init: true,
+        driverId,
+        bookings: nearby,
+        currentBookings,
+        user: { id: driverId, type: 'driver' }
+      };
+      try { logger.info('[socket->driver] emit booking:nearby ', { sid: socket.id, userId: driverId, nearbyCount: payload.bookings.length, currentCount: payload.currentBookings.length }); } catch (_) {}
+      const { shouldSkipDuplicate } = require('./utils');
+      if (!shouldSkipDuplicate(socket.id, 'booking:nearby', { id: 'snapshot', driverId })) {
+        socket.emit('booking:nearby', payload);
+      }
+    } catch (_) {}
+  }
   // On connection, send initial nearby unassigned bookings (pre-existing) and current driver bookings
   try {
     if (socket.user && String(socket.user.type).toLowerCase() === 'driver') {
@@ -11,95 +100,7 @@ module.exports = (io, socket) => {
         const driverRoom = `driver:${String(socket.user.id)}`;
         socket.join(driverRoom);
       } catch (_) {}
-      (async () => {
-        try {
-          const { Booking } = require('../models/bookingModels');
-          const { Driver } = require('../models/userModels');
-          const { Wallet } = require('../models/common');
-          const financeService = require('../services/financeService');
-          const geolib = require('geolib');
-
-          const driverId = String(socket.user.id);
-          const me = await Driver.findById(driverId).lean();
-          const radiusKm = parseFloat(process.env.BROADCAST_RADIUS_KM || process.env.RADIUS_KM || '5');
-
-          // Current bookings assigned to this driver
-          const currentRows = await Booking.find({ driverId, status: { $in: ['accepted', 'ongoing', 'requested'] } })
-            .sort({ createdAt: -1 })
-            .limit(50)
-            .lean();
-
-          const currentBookings = currentRows.map(b => ({
-            id: String(b._id),
-            status: b.status,
-            pickup: b.pickup,
-            dropoff: b.dropoff,
-            fareEstimated: b.fareEstimated,
-            fareFinal: b.fareFinal,
-            distanceKm: b.distanceKm,
-            passenger: b.passengerId ? { id: String(b.passengerId), name: b.passengerName, phone: b.passengerPhone } : undefined,
-            createdAt: b.createdAt,
-            updatedAt: b.updatedAt,
-            patch: {
-              status: b.status,
-              passengerId: String(b.passengerId || ''),
-              vehicleType: b.vehicleType,
-              pickup: b.pickup,
-              dropoff: b.dropoff,
-              passenger: b.passengerId ? { id: String(b.passengerId), name: b.passengerName, phone: b.passengerPhone } : undefined
-            }
-          }));
-
-          // Nearby unassigned requested bookings created before connection
-let nearby = [];
-try {
-  if (me && me.lastKnownLocation && Number.isFinite(me.lastKnownLocation.latitude) && Number.isFinite(me.lastKnownLocation.longitude)) {
-    const open = await Booking.find({ status: 'requested', $or: [{ driverId: { $exists: false } }, { driverId: null }, { driverId: '' }] })
-      .sort({ createdAt: -1 })
-      .limit(200)
-      .lean();
-    const withDistance = open.map(b => ({
-      booking: b,
-      distanceKm: geolib.getDistance(
-        { latitude: me.lastKnownLocation.latitude, longitude: me.lastKnownLocation.longitude },
-        { latitude: b.pickup?.latitude, longitude: b.pickup?.longitude }
-      ) / 1000
-    }))
-      .filter(x => Number.isFinite(x.distanceKm) && x.distanceKm <= radiusKm)
-      .sort((a, b) => a.distanceKm - b.distanceKm);
-
-    // Filter by package affordability
-    const w = await Wallet.findOne({ userId: driverId, role: 'driver' }).lean();
-    const balance = w ? Number(w.balance || 0) : 0;
-    nearby = withDistance
-      .filter(x => financeService.canAcceptBooking(balance, x.booking.fareFinal || x.booking.fareEstimated || 0))
-      .slice(0, 50)
-      .map(x => ({
-        id: String(x.booking._id),
-        status: x.booking.status,
-        pickup: x.booking.pickup,
-        dropoff: x.booking.dropoff,
-        fareEstimated: x.booking.fareEstimated,
-        fareFinal: x.booking.fareFinal,
-        distanceKm: Math.round(x.distanceKm * 100) / 100,
-        passenger: x.booking.passengerId ? { id: String(x.booking.passengerId), name: x.booking.passengerName, phone: x.booking.passengerPhone } : undefined,
-        createdAt: x.booking.createdAt,
-        updatedAt: x.booking.updatedAt
-      }));
-  }
-} catch (_) {}
-
-          const payload = {
-            init: true,
-            driverId,
-            bookings: nearby,
-            currentBookings,
-            user: { id: driverId, type: 'driver' }
-          };
-          try { logger.info('[socket->driver] emit booking:nearby ', { sid: socket.id, userId: driverId, nearbyCount: payload.bookings.length, currentCount: payload.currentBookings.length }); } catch (_) {}
-          socket.emit('booking:nearby', payload);
-        } catch (_) {}
-      })();
+      emitNearbySnapshotForDriver();
     }
   } catch (_) {}
 
@@ -119,6 +120,15 @@ try {
     } catch (err) {
       socket.emit('booking_error', { message: 'Failed to update availability', source: 'driver:availability' });
     }
+  });
+
+  // Allow client to request a fresh nearby snapshot after reconnect or on-demand
+  socket.on('request:nearby_snapshot', async () => {
+    try { logger.info('[socket<-driver] request:nearby_snapshot', { sid: socket.id, userId: socket.user && socket.user.id }); } catch (_) {}
+    if (!socket.user || String(socket.user.type).toLowerCase() !== 'driver') {
+      return socket.emit('booking_error', { message: 'Unauthorized: driver token required', source: 'request:nearby_snapshot' });
+    }
+    await emitNearbySnapshotForDriver();
   });
 
   // booking:driver_location_update
