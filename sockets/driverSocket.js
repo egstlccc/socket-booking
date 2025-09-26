@@ -117,6 +117,8 @@ module.exports = (io, socket) => {
       const updated = await driverService.setAvailability(String(socket.user.id), available, socket.user);
       driverEvents.emitDriverAvailability(String(socket.user.id), !!available);
       try { logger.info('[socket->driver] availability updated', { userId: socket.user && socket.user.id, available }); } catch (_) {}
+      // After availability change, push a fresh nearby snapshot so UI reflects opportunities
+      try { await emitNearbySnapshotForDriver(); } catch (_) {}
     } catch (err) {
       socket.emit('booking_error', { message: 'Failed to update availability', source: 'driver:availability' });
     }
