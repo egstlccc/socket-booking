@@ -76,20 +76,8 @@ module.exports = (io, socket) => {
         .sort((a, b) => a.distanceKm - b.distanceKm);
 
         const targetFare = booking.fareFinal || booking.fareEstimated || 0;
-        let chosenDriver = null;
-        for (const item of withDistance) {
-          try {
-            const w = await Wallet.findOne({ userId: String(item.driver._id), role: 'driver' }).lean();
-            const balance = w ? Number(w.balance || 0) : 0;
-            if (financeService.canAcceptBooking(balance, targetFare)) {
-              chosenDriver = item.driver;
-              break;
-            }
-          } catch (_) {}
-        }
-
-        if (chosenDriver) {
-          const bookingDetails = {
+        // Build payloads once
+        const bookingDetails = {
             id: String(booking._id),
             status: 'requested',
             passengerId,
@@ -102,25 +90,38 @@ module.exports = (io, socket) => {
             distanceKm: booking.distanceKm,
             createdAt: booking.createdAt,
             updatedAt: booking.updatedAt
-          };
-          const patch = {
+        };
+        const patch = {
             status: 'requested',
             passengerId,
             vehicleType: booking.vehicleType,
             pickup: booking.pickup,
             dropoff: booking.dropoff,
             passenger: { id: passengerId, name: socket.user.name, phone: socket.user.phone }
-          };
-          const payloadForDriver = { bookingId: String(booking._id), booking: bookingDetails, patch, user: { id: passengerId, type: 'passenger' } };
-          const channel = `driver:${String(chosenDriver._id)}`;
-          // Deduplicate dispatch per booking-driver
-          if (!wasDispatched(String(booking._id), String(chosenDriver._id))) {
-            sendMessageToSocketId(channel, { event: 'booking:new', data: payloadForDriver });
-            markDispatched(String(booking._id), String(chosenDriver._id));
-            try { logger.info('message sent to:  driver:' + String(chosenDriver._id), { bookingId: String(booking._id) }); } catch (_) {}
-          } else {
-            try { logger.info('skipped duplicate booking:new', { bookingId: String(booking._id), driverId: String(chosenDriver._id) }); } catch (_) {}
-          }
+        };
+        const payloadForDriver = { bookingId: String(booking._id), booking: bookingDetails, patch, user: { id: passengerId, type: 'passenger' } };
+
+        // Determine all eligible nearby drivers and broadcast booking:new to each (incremental update)
+        const eligible = [];
+        for (const item of withDistance) {
+          try {
+            const w = await Wallet.findOne({ userId: String(item.driver._id), role: 'driver' }).lean();
+            const balance = w ? Number(w.balance || 0) : 0;
+            if (financeService.canAcceptBooking(balance, targetFare)) {
+              eligible.push(item.driver);
+            }
+          } catch (_) {}
+        }
+
+        if (eligible.length > 0) {
+          eligible.forEach(d => {
+            const channel = `driver:${String(d._id)}`;
+            if (!wasDispatched(String(booking._id), String(d._id))) {
+              sendMessageToSocketId(channel, { event: 'booking:new', data: payloadForDriver });
+              markDispatched(String(booking._id), String(d._id));
+            }
+          });
+          try { logger.info('[socket->drivers] booking:new broadcast', { bookingId: String(booking._id), count: eligible.length }); } catch (_) {}
         } else {
           try { logger.info('[socket->drivers] no eligible driver (package/distance)', { bookingId: String(booking._id) }); } catch (_) {}
         }
@@ -161,6 +162,7 @@ module.exports = (io, socket) => {
           rating: (d && (d.rating || d.rating === 0 ? d.rating : undefined)) ?? 5.0,
           carPlate: d && d.carPlate || socket.user.carPlate
         };
+        // Emit a backward-compatible event name
         const acceptPayload = {
           bookingId: String(updated._id),
           status: 'accepted',
@@ -169,6 +171,33 @@ module.exports = (io, socket) => {
         };
         try { logger.info('[socket->room] booking_accept', { room, bookingId: acceptPayload.bookingId, driverId: driverPayload.id }); } catch (_) {}
         io.to(room).emit('booking_accept', acceptPayload);
+
+        // Emit booking:accepted with a full booking object for clients expecting the complete payload
+        try {
+          const fullBookingPayload = {
+            id: String(updated._id),
+            passengerId: String(updated.passengerId || ''),
+            driverId: String(updated.driverId || ''),
+            pickup: updated.pickup || { latitude: 0.0, longitude: 0.0, address: 'Unknown Location', name: 'Unknown' },
+            dropoff: updated.dropoff || { latitude: 0.0, longitude: 0.0, address: 'Unknown Location', name: 'Unknown' },
+            vehicleType: updated.vehicleType || 'unknown',
+            status: 'accepted',
+            estimatedFare: updated.fareEstimated ?? null,
+            finalFare: updated.fareFinal ?? null,
+            paymentMethod: updated.paymentMethod || 'cash',
+            driver: {
+              name: driverPayload.name || null,
+              photoUrl: (d && d.photoUrl) || null,
+              rating: (driverPayload.rating ?? null),
+              phone: driverPayload.phone || null,
+              vehicle: driverPayload.carName || driverPayload.vehicleType || null
+            },
+            createdAt: updated.createdAt,
+            updatedAt: updated.updatedAt
+          };
+          try { logger.info('[socket->room] booking:accepted', { bookingId: fullBookingPayload.id, driverId: driverPayload.id }); } catch (_) {}
+          io.to(room).emit('booking:accepted', fullBookingPayload);
+        } catch (_) {}
       } catch (_) {}
 
       // Inform nearby drivers to remove
@@ -190,7 +219,10 @@ module.exports = (io, socket) => {
         nearby.forEach(d => sendMessageToSocketId(`driver:${String(d._id)}`, { event: 'booking:removed', data: { bookingId: String(updated._id) } }));
         try { logger.info('[socket->drivers] booking:removed broadcast', { bookingId: String(updated._id), count: nearby.length }); } catch (_) {}
       } catch (_) {}
-    } catch (err) {}
+    } catch (err) {
+      try { logger.error('[booking_accept] error', err); } catch (_) {}
+      socket.emit('booking_error', { message: err && err.message ? err.message : 'Failed to accept booking', code: err && err.status, source: 'booking_accept' });
+    }
   });
 
   // booking_cancel

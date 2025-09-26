@@ -23,7 +23,10 @@ module.exports = (io, socket) => {
         dropoff: booking.dropoff
       };
       try { logger.info('[socket->user] booking:status', { bookingId: out.bookingId, status: out.status }); } catch (_) {}
-      socket.emit('booking:status', out);
+      const { shouldSkipDuplicate } = require('./utils');
+      if (!shouldSkipDuplicate(socket.id, 'booking:status', out)) {
+        socket.emit('booking:status', out);
+      }
     } catch (err) {
       socket.emit('booking_error', { message: 'Failed to fetch booking status', source: 'booking:status_request' });
     }
